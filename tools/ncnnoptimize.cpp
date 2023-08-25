@@ -366,7 +366,6 @@ int NetOptimize::fuse_convolution_mul_with_scalar()
 
         int channels = convolution->num_output;
 
-
         fprintf(stderr, "fuse_convolution_mul %s %s\n", convolution->name.c_str(), binaryop->name.c_str());
 
         {
@@ -425,21 +424,18 @@ int NetOptimize::fuse_add_with_scalar_convolution()
         if (j == layer_count)
             continue;
 
-
-        ncnn::Convolution* convolution = (ncnn::Convolution*) layers[j];
+        ncnn::Convolution* convolution = (ncnn::Convolution*)layers[j];
 
         int channels = convolution->num_output;
-
 
         fprintf(stderr, "fuse_add_convolution %s %s\n", binaryop->name.c_str(), convolution->name.c_str());
 
         {
             // get a*b
-            ncnn::Mat b;// = ncnn::Mat(convolution->weight_data.shape());
+            ncnn::Mat b; // = ncnn::Mat(convolution->weight_data.shape());
             b.create_like(convolution->weight_data);
             b.fill(binaryop->b);
             convolution->forward_inplace(b, opt);
-
 
             if (convolution->bias_term == 0)
             {
@@ -492,11 +488,9 @@ int NetOptimize::fuse_mul_with_scalar_convolution()
         if (j == layer_count)
             continue;
 
-
-        ncnn::Convolution* convolution = (ncnn::Convolution*) layers[j];
+        ncnn::Convolution* convolution = (ncnn::Convolution*)layers[j];
 
         int channels = convolution->num_output;
-
 
         fprintf(stderr, "fuse_mul_convolution %s %s\n", binaryop->name.c_str(), convolution->name.c_str());
 
@@ -646,7 +640,6 @@ int NetOptimize::fuse_convolution_add_with_scalar()
 
         if (binaryop->op_type != 0 || binaryop->with_scalar != 1)
             continue;
-
 
         int channels = convolution->num_output;
 
@@ -857,7 +850,7 @@ int NetOptimize::fuse_convolutiondepthwise_add_with_scalar()
         // fuse ConvolutionDepthWise - BinaryOp to ConvolutionDepthWise
         ncnn::BinaryOp* binaryop = (ncnn::BinaryOp*)layers[j];
 
-        if (binaryop->op_type != 0|| binaryop->with_scalar != 1)
+        if (binaryop->op_type != 0 || binaryop->with_scalar != 1)
             continue;
 
         int channels = convolutiondepthwise->num_output;
@@ -2178,9 +2171,9 @@ int NetOptimize::fuse_memorydata_binaryop()
             int op_type = binaryop->op_type;
 
             if (op_type == ncnn::BinaryOp::Operation_ADD
-                || op_type == ncnn::BinaryOp::Operation_MUL
-                || op_type == ncnn::BinaryOp::Operation_MAX
-                || op_type == ncnn::BinaryOp::Operation_MIN)
+                    || op_type == ncnn::BinaryOp::Operation_MUL
+                    || op_type == ncnn::BinaryOp::Operation_MAX
+                    || op_type == ncnn::BinaryOp::Operation_MIN)
             {
                 memorydata_index = 0;
             }
@@ -2281,9 +2274,9 @@ int NetOptimize::fuse_memorydata_binaryop()
             int op_type = binaryop->op_type;
 
             if (op_type == ncnn::BinaryOp::Operation_ADD
-                || op_type == ncnn::BinaryOp::Operation_MUL
-                || op_type == ncnn::BinaryOp::Operation_MAX
-                || op_type == ncnn::BinaryOp::Operation_MIN)
+                    || op_type == ncnn::BinaryOp::Operation_MUL
+                    || op_type == ncnn::BinaryOp::Operation_MAX
+                    || op_type == ncnn::BinaryOp::Operation_MIN)
             {
                 memorydata_index = 0;
             }
