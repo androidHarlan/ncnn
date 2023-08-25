@@ -63,7 +63,8 @@ public:
     int fuse_deconvolution_batchnorm();
     int fuse_deconvolution_mul();
     int fuse_deconvolution_add();
-    //    int fuse_add_with_scalar_convolutiondepthwise();
+    int fuse_mul_with_scalar_convolutiondepthwise();
+    int fuse_add_with_scalar_convolutiondepthwise();
     int fuse_deconvolutiondepthwise_batchnorm();
     int fuse_innerproduct_batchnorm();
     int fuse_innerproduct_add();
@@ -367,7 +368,7 @@ int NetOptimize::fuse_convolution_mul_with_scalar()
         int channels = convolution->num_output;
 
 
-        fprintf(stderr, "fuse_convolution_mul %s %s\n", convolution->name.c_str(), binaryop->name.c_str());
+        fprintf(stderr, "fuse_convolution_mul_with_scalar %s %s\n", convolution->name.c_str(), binaryop->name.c_str());
 
         {
             const int weight_per_outch = convolution->weight_data_size / channels;
@@ -431,7 +432,7 @@ int NetOptimize::fuse_add_with_scalar_convolution()
         int channels = convolution->num_output;
 
 
-        fprintf(stderr, "fuse_add_convolution %s %s\n", binaryop->name.c_str(), convolution->name.c_str());
+        fprintf(stderr, "fuse_add_with_scalar_convolution %s %s\n", binaryop->name.c_str(), convolution->name.c_str());
 
         {
             // get a*b
@@ -498,7 +499,7 @@ int NetOptimize::fuse_mul_with_scalar_convolution()
         int channels = convolution->num_output;
 
 
-        fprintf(stderr, "fuse_mul_convolution %s %s\n", binaryop->name.c_str(), convolution->name.c_str());
+        fprintf(stderr, "fuse_mul_with_scalar_convolution %s %s\n", binaryop->name.c_str(), convolution->name.c_str());
 
         {
             const int weight_per_outch = convolution->weight_data_size / channels;
@@ -522,6 +523,131 @@ int NetOptimize::fuse_mul_with_scalar_convolution()
     }
     return 0;
 }
+int NetOptimize::fuse_add_with_scalar_convolutiondepthwise()
+{
+    // y = a*(b+x)+c -> y = a*x + a*b + c
+    const size_t layer_count = layers.size();
+    for (size_t i = 0; i < layer_count; i++)
+    {
+        if (layers[i]->type != "BinaryOp")
+            continue;
+        ncnn::BinaryOp* binaryop = (ncnn::BinaryOp*)layers[i];
+
+        if (binaryop->op_type != 0 || binaryop->with_scalar != 1)
+            continue;
+        //  BinaryOp - Convolution
+        int top_blob_index = layers[i]->tops[0];
+
+        size_t j = i + 1;
+        for (; j < layer_count; j++)
+        {
+            if (layers[j]->type != "ConvolutionDepthWise")
+                continue;
+
+            if (layers[j]->bottoms[0] == top_blob_index)
+                break;
+        }
+
+        if (j == layer_count)
+            continue;
+
+
+        ncnn::ConvolutionDepthWise* convolution = (ncnn::ConvolutionDepthWise*) layers[j];
+
+        int channels = convolution->num_output;
+
+
+        fprintf(stderr, "fuse_add_with_scalar_convolutiondepthwise %s %s\n", binaryop->name.c_str(), convolution->name.c_str());
+
+        {
+            const int weight_per_outch = convolution->weight_data_size / channels;
+
+            float* weight = convolution->weight_data;
+            if (convolution->bias_term == 0)
+            {
+                convolution->bias_term = 1;
+                convolution->bias_data = ncnn::Mat(convolution->group);
+                convolution->bias_data.fill(0.f);
+            }
+            float* bias = convolution->bias_data;
+            for (int i = 0; i < channels; i++)
+            {
+                float* conv_weight_outch = weight + weight_per_outch * i;
+                float channel_sum = 0.f;
+                for (int j = 0; j < weight_per_outch; j++)
+                {
+                    channel_sum += conv_weight_outch[j] *binaryop->b;
+                }
+                bias[i] += channel_sum;
+            }
+        }
+
+        int bottom_blob_index_final = binaryop->bottoms[0];
+        convolution->bottoms[0] = bottom_blob_index_final;
+        blobs[bottom_blob_index_final].producer = i;
+        binaryop->type = "ncnnfused";
+    }
+    return 0;
+}
+
+int NetOptimize::fuse_mul_with_scalar_convolutiondepthwise()
+{
+    // y = a*b*x+c
+    const size_t layer_count = layers.size();
+    for (size_t i = 0; i < layer_count; i++)
+    {
+        if (layers[i]->type != "BinaryOp")
+            continue;
+        ncnn::BinaryOp* binaryop = (ncnn::BinaryOp*)layers[i];
+
+        if (binaryop->op_type != 2 || binaryop->with_scalar != 1)
+            continue;
+        //  BinaryOp - Convolution
+        int top_blob_index = layers[i]->tops[0];
+
+        size_t j = i + 1;
+        for (; j < layer_count; j++)
+        {
+            if (layers[j]->type != "ConvolutionDepthWise")
+                continue;
+
+            if (layers[j]->bottoms[0] == top_blob_index)
+                break;
+        }
+
+        if (j == layer_count)
+            continue;
+
+
+        ncnn::ConvolutionDepthWise* convolution = (ncnn::ConvolutionDepthWise*) layers[j];
+
+        int channels = convolution->num_output;
+
+
+        fprintf(stderr, "fuse_mul_with_scalar_convolutiondepthwise %s %s\n", binaryop->name.c_str(), convolution->name.c_str());
+
+        {
+            const int weight_per_outch = convolution->weight_data_size / channels;
+
+            float* weight = convolution->weight_data;
+            for (int i = 0; i < channels; i++)
+            {
+                float* conv_weight_outch = weight + weight_per_outch * i;
+                for (int j = 0; j < weight_per_outch; j++)
+                {
+                    conv_weight_outch[j] = conv_weight_outch[j] *binaryop->b;
+                }
+            }
+        }
+
+        int bottom_blob_index_final = binaryop->bottoms[0];
+        convolution->bottoms[0] = bottom_blob_index_final;
+        blobs[bottom_blob_index_final].producer = i;
+        binaryop->type = "ncnnfused";
+    }
+    return 0;
+}
+
 
 int NetOptimize::fuse_convolution_add()
 {
@@ -650,7 +776,7 @@ int NetOptimize::fuse_convolution_add_with_scalar()
 
         int channels = convolution->num_output;
 
-        fprintf(stderr, "fuse_convolution_add %s %s\n", convolution->name.c_str(), binaryop->name.c_str());
+        fprintf(stderr, "fuse_convolution_add_with_scalar %s %s\n", convolution->name.c_str(), binaryop->name.c_str());
 
         {
             if (convolution->bias_term == 0)
@@ -797,7 +923,7 @@ int NetOptimize::fuse_convolutiondepthwise_mul_with_scalar()
 
         int channels = convolutiondepthwise->num_output;
 
-        fprintf(stderr, "fuse_convolutiondepthwise_mul %s %s\n", convolutiondepthwise->name.c_str(), binaryop->name.c_str());
+        fprintf(stderr, "fuse_convolutiondepthwise_mul_with_scalar %s %s\n", convolutiondepthwise->name.c_str(), binaryop->name.c_str());
 
         {
             const int weight_per_outch = convolutiondepthwise->weight_data_size / channels;
@@ -862,7 +988,7 @@ int NetOptimize::fuse_convolutiondepthwise_add_with_scalar()
 
         int channels = convolutiondepthwise->num_output;
 
-        fprintf(stderr, "fuse_convolutiondepthwise_mul %s %s\n", convolutiondepthwise->name.c_str(), binaryop->name.c_str());
+        fprintf(stderr, "fuse_convolutiondepthwise_add_with_scalar %s %s\n", convolutiondepthwise->name.c_str(), binaryop->name.c_str());
 
         {
             const int weight_per_outch = convolutiondepthwise->weight_data_size / channels;
@@ -3220,8 +3346,9 @@ int main(int argc, char** argv)
     optimizer.fuse_convolution_mul_with_scalar();
     optimizer.fuse_convolution_add_with_scalar();
     optimizer.fuse_add_with_scalar_convolution();
-    //    optimizer.fuse_add_with_scalar_convolutiondepthwise();
     optimizer.fuse_mul_with_scalar_convolution();
+    optimizer.fuse_add_with_scalar_convolutiondepthwise();
+    optimizer.fuse_mul_with_scalar_convolutiondepthwise();
 
     optimizer.replace_reduction_with_global_pooling();
     optimizer.replace_prelu_with_leaky_relu();
