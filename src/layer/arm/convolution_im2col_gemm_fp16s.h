@@ -3017,236 +3017,13 @@ static void convolution_gemm_transB_packed_tile_fp16sa(const Mat& AT_tile, const
     }
 }
 
-static void convolution_im2col_gemm_get_optimal_tile_mnk_fp16sa(int M, int N, int K, int& TILE_M, int& TILE_N, int& TILE_K, int nT)
-{
-    // resolve optimal tile size from cache size
-    const int l2_cache_size_fp16 = (int)(get_cpu_level2_cache_size() / sizeof(unsigned short));
-
-    if (nT == 0)
-        nT = get_physical_big_cpu_count();
-
-    // solve K
-    {
-        // try not to split K
-        int tile_size = (l2_cache_size_fp16 - 32) / 12;
-
-        TILE_K = std::max(8, tile_size / 8 * 8);
-
-        int nn_K = (K + TILE_K - 1) / TILE_K;
-        TILE_K = std::min(TILE_K, ((K + nn_K - 1) / nn_K + 7) / 8 * 8);
-    }
-
-    // solve M
-    {
-        int nn_M = (M + 63) / 64;
-
-        TILE_M = std::max(8, ((M + nn_M - 1) / nn_M + 7) / 8 * 8);
-    }
-
-    {
-        TILE_M *= std::min(nT, get_physical_cpu_count());
-
-        int nn_M = (M + TILE_M - 1) / TILE_M;
-        TILE_M = std::min(TILE_M, ((M + nn_M - 1) / nn_M + 7) / 8 * 8);
-
-        if (nT > 1)
-        {
-            TILE_M = std::min(TILE_M, (std::max(1, TILE_M / nT) + 7) / 8 * 8);
-        }
-    }
-
-    if (N > 0)
-    {
-        int tile_size;
-        if (TILE_K >= K)
-        {
-            tile_size = (l2_cache_size_fp16 - TILE_M * TILE_K) / TILE_K;
-        }
-        else
-        {
-            tile_size = (l2_cache_size_fp16 - TILE_M * TILE_K) / (TILE_M + TILE_K);
-        }
-
-        TILE_N = std::max(4, tile_size / 4 * 4);
-
-        int nn_N = (N + TILE_N - 1) / TILE_N;
-        TILE_N = std::min(TILE_N, ((N + nn_N - 1) / nn_N + 3) / 4 * 4);
-    }
-}
-
-static void convolution_im2col_gemm_transform_kernel_fp16sa(const Mat& kernel, Mat& AT, int inch, int outch, int kernel_w, int kernel_h, const Option& opt)
-{
-    // NCNN_LOGE("convolution_im2col_gemm_transform_kernel_fp16sa %p", kernel.data);
-    const int maxk = kernel_w * kernel_h;
-
-    const int M = outch;
-    const int K = inch * maxk;
-
-    int TILE_M, TILE_N, TILE_K;
-    convolution_im2col_gemm_get_optimal_tile_mnk_fp16sa(M, 0, K, TILE_M, TILE_N, TILE_K, opt.num_threads);
-
-    const int nn_M = (M + TILE_M - 1) / TILE_M;
-
-    int elempack = 1;
-    if (opt.use_packing_layout)
-    {
-        elempack = inch % 8 == 0 ? 8 : inch % 4 == 0 ? 4 : 1;
-    }
-
-    // maxk-inch-outch to pa-maxk-inch/pa-outch
-    Mat A_data;
-    if (maxk == 1)
-    {
-        cast_float32_to_float16(kernel, A_data);
-        A_data = A_data.reshape(maxk * inch, outch);
-    }
-    else
-    {
-        Mat weight_data_r2 = kernel.reshape(maxk, inch, outch);
-
-        A_data.create(maxk * inch, outch, (size_t)2u);
-
-        for (int q = 0; q < outch; q += 1)
-        {
-            __fp16* g00 = A_data.row<__fp16>(q);
-
-            for (int p = 0; p + (elempack - 1) < inch; p += elempack)
-            {
-                for (int k = 0; k < maxk; k++)
-                {
-                    for (int i = 0; i < elempack; i++)
-                    {
-                        const float* k00 = weight_data_r2.channel(q).row(p + i);
-                        g00[0] = (__fp16)k00[k];
-                        g00++;
-                    }
-                }
-            }
-        }
-    }
-
-    AT.create(TILE_K * TILE_M, (K + TILE_K - 1) / TILE_K, (M + TILE_M - 1) / TILE_M, (size_t)2u);
-
-    #pragma omp parallel for num_threads(opt.num_threads)
-    for (int ppj = 0; ppj < nn_M; ppj++)
-    {
-        const int i = ppj * TILE_M;
-
-        const int max_ii = std::min((M - i), TILE_M);
-
-        for (int k = 0; k < K; k += TILE_K)
-        {
-            const int max_kk = std::min((K - k), TILE_K);
-
-            Mat AT_tile = AT.channel(i / TILE_M).row_range(k / TILE_K, 1);
-
-            convolution_im2col_pack_A_tile_bf16_fp16(A_data, AT_tile, i, max_ii, k, max_kk);
-        }
-    }
-}
-
-static int convolution_im2col_gemm_fp16sa(const Mat& bottom_blob, Mat& top_blob, const Mat& AT, const Mat& bias, int kernel_w, int kernel_h, int dilation_w, int dilation_h, int stride_w, int stride_h, int nT, const Option& opt)
-{
-    // NCNN_LOGE("convolution_im2col_gemm_fp16sa %p %p %p %p", bottom_blob.data, top_blob.data, AT.data, bias.data);
-    const int maxk = kernel_w * kernel_h;
-
-    const int M = top_blob.c * top_blob.elempack;
-    const int N = top_blob.w * top_blob.h;
-    const int K = bottom_blob.c * bottom_blob.elempack * maxk;
-
-    int TILE_M, TILE_N, TILE_K;
-    convolution_im2col_gemm_get_optimal_tile_mnk_fp16sa(M, N, K, TILE_M, TILE_N, TILE_K, nT);
-
-    const int nn_M = (M + TILE_M - 1) / TILE_M;
-    const int nn_N = (N + TILE_N - 1) / TILE_N;
-    const int nn_K = (K + TILE_K - 1) / TILE_K;
-
-    // NCNN_LOGE("TILE M/N/K = %d %d %d -> %d %d %d", M, N, K, TILE_M, TILE_N, TILE_K);
-
-    Mat BT(TILE_K * TILE_N, (K + TILE_K - 1) / TILE_K, (N + TILE_N - 1) / TILE_N, 2u, opt.workspace_allocator);
-    if (BT.empty())
-        return -100;
-
-    const int nn_NK = nn_N * nn_K;
-
-    #pragma omp parallel for num_threads(nT)
-    for (int ppjk = 0; ppjk < nn_NK; ppjk++)
-    {
-        const int ppj = ppjk / nn_K;
-        const int ppk = ppjk % nn_K;
-
-        const int j = ppj * TILE_N;
-        const int k = ppk * TILE_K;
-
-        const int max_jj = std::min((N - j), TILE_N);
-        const int max_kk = std::min((K - k), TILE_K);
-
-        Mat BT_tile = BT.channel(j / TILE_N).row_range(k / TILE_K, 1);
-
-        // im2col
-        convolution_im2col_input_tile_bf16_fp16(bottom_blob, BT_tile, j, max_jj, k, max_kk, kernel_w, kernel_h, dilation_w, dilation_h, stride_w, stride_h);
-    }
-
-    Mat topT_tileX;
-    if (K > TILE_K)
-    {
-        topT_tileX.create(TILE_N * TILE_M, 1, nT, 2u, opt.workspace_allocator);
-        if (topT_tileX.empty())
-            return -100;
-    }
-
 #if __aarch64__ && NCNN_APPLE_AMX
-    bool amx_supported = cpu_support_arm_amx();
-#endif
-
-    #pragma omp parallel for num_threads(nT)
-    for (int ppj = 0; ppj < nn_M; ppj++)
-    {
-        const int i = ppj * TILE_M;
-
-        Mat topT_tile;
-        if (K > TILE_K)
-            topT_tile = topT_tileX.channel(get_omp_thread_num());
-
-        const int max_ii = std::min((M - i), TILE_M);
-
-        for (int j = 0; j < N; j += TILE_N)
-        {
-            const int max_jj = std::min((N - j), TILE_N);
-
-            for (int k = 0; k < K; k += TILE_K)
-            {
-                const int max_kk = std::min((K - k), TILE_K);
-
-                const Mat AT_tile = AT.channel(i / TILE_M).row_range(k / TILE_K, 1);
-
-                const Mat BT_tile = BT.channel(j / TILE_N).row_range(k / TILE_K, 1);
-
-                bool k_end = k + TILE_K >= K;
-
-#if __aarch64__ && NCNN_APPLE_AMX
-                if (amx_supported)
-                {
-                    convolution_gemm_transB_packed_tile_fp16sa_amx(AT_tile, BT_tile, bias, topT_tile, top_blob, i, max_ii, j, max_jj, k, max_kk, k_end);
-                }
-                else
-#endif
-                {
-                    convolution_gemm_transB_packed_tile_fp16sa(AT_tile, BT_tile, bias, topT_tile, top_blob, i, max_ii, j, max_jj, k, max_kk, k_end, opt.use_a53_a55_optimized_kernel);
-                }
-            }
-        }
-    }
-
-    return 0;
-}
-
-#if __aarch64__ && NCNN_APPLE_AMX
+#include <amx_usability.h>
 
 static void convolution_gemm_transB_packed_tile_fp16sa_amx(const Mat& AT_tile, const Mat& BT_tile, const Mat& CT_tile, Mat& topT_tile, Mat& top_blob, int i, int max_ii, int j, int max_jj, int k, int max_kk, bool k_end)
 {
     // NCNN_LOGE("convolution_gemm_transB_packed_tile_fp16sa_amx %d %d %d %d %d %d", i, max_ii, j, max_jj, k, max_kk);
-
+    amx_set();
     const int out_elempack = top_blob.elempack;
     const int out_hstep = (int)top_blob.cstep;
 
@@ -3269,93 +3046,38 @@ static void convolution_gemm_transB_packed_tile_fp16sa_amx(const Mat& AT_tile, c
         }
 
         int jj = 0;
+        // NCNN_LOGE("max_jj %d", max_jj);
         for (; jj + 11 < max_jj; jj += 12)
         {
             const __fp16* pA = pAT;
-
-            float16x8_t _sum0;
-            float16x8_t _sum1;
-            float16x8_t _sum2;
-            float16x8_t _sum3;
-            float16x8_t _sum4;
-            float16x8_t _sum5;
-            float16x8_t _sum6;
-            float16x8_t _sum7;
-            float16x8_t _sum8;
-            float16x8_t _sum9;
-            float16x8_t _suma;
-            float16x8_t _sumb;
 
             if (k == 0)
             {
                 if (pC)
                 {
-                    _sum0 = vld1q_f16(pC);
-                    _sum1 = _sum0;
-                    _sum2 = _sum0;
-                    _sum3 = _sum0;
-                    _sum4 = _sum0;
-                    _sum5 = _sum0;
-                    _sum6 = _sum0;
-                    _sum7 = _sum0;
-                    _sum8 = _sum0;
-                    _sum9 = _sum0;
-                    _suma = _sum0;
-                    _sumb = _sum0;
+                    for (int r = 0; r < 12; r++)
+                        amx_ldz(false, 2*r, pC);
                 }
                 else
                 {
-                    _sum0 = vdupq_n_f16(0.f);
-                    _sum1 = vdupq_n_f16(0.f);
-                    _sum2 = vdupq_n_f16(0.f);
-                    _sum3 = vdupq_n_f16(0.f);
-                    _sum4 = vdupq_n_f16(0.f);
-                    _sum5 = vdupq_n_f16(0.f);
-                    _sum6 = vdupq_n_f16(0.f);
-                    _sum7 = vdupq_n_f16(0.f);
-                    _sum8 = vdupq_n_f16(0.f);
-                    _sum9 = vdupq_n_f16(0.f);
-                    _suma = vdupq_n_f16(0.f);
-                    _sumb = vdupq_n_f16(0.f);
+                    __fp16 sums[16];
+                    memset(sums, 0, 16 * sizeof(__fp16));
+                    for (int r = 0; r < 12; r++)
+                        amx_ldz(false, 2*r, sums);
                 }
             }
             else
             {
-                _sum0 = vld1q_f16(outptr);
-                _sum1 = vld1q_f16(outptr + 8);
-                _sum2 = vld1q_f16(outptr + 8 * 2);
-                _sum3 = vld1q_f16(outptr + 8 * 3);
-                _sum4 = vld1q_f16(outptr + 8 * 4);
-                _sum5 = vld1q_f16(outptr + 8 * 5);
-                _sum6 = vld1q_f16(outptr + 8 * 6);
-                _sum7 = vld1q_f16(outptr + 8 * 7);
-                _sum8 = vld1q_f16(outptr + 8 * 8);
-                _sum9 = vld1q_f16(outptr + 8 * 9);
-                _suma = vld1q_f16(outptr + 8 * 10);
-                _sumb = vld1q_f16(outptr + 8 * 11);
+                for (int r = 0; r < 12; r++)
+                    amx_ldz(false, 2*r, outptr + 8 * r);
             }
 
             int kk = 0;
             for (; kk < max_kk; kk += 1)
             {
-                float16x8_t _pA = vld1q_f16(pA);
-
-                float16x4_t _pB0 = vld1_f16(pB);
-                float16x4_t _pB1 = vld1_f16(pB + 4);
-                float16x4_t _pB2 = vld1_f16(pB + 8);
-
-                _sum0 = vfmaq_lane_f16(_sum0, _pA, _pB0, 0);
-                _sum1 = vfmaq_lane_f16(_sum1, _pA, _pB0, 1);
-                _sum2 = vfmaq_lane_f16(_sum2, _pA, _pB0, 2);
-                _sum3 = vfmaq_lane_f16(_sum3, _pA, _pB0, 3);
-                _sum4 = vfmaq_lane_f16(_sum4, _pA, _pB1, 0);
-                _sum5 = vfmaq_lane_f16(_sum5, _pA, _pB1, 1);
-                _sum6 = vfmaq_lane_f16(_sum6, _pA, _pB1, 2);
-                _sum7 = vfmaq_lane_f16(_sum7, _pA, _pB1, 3);
-                _sum8 = vfmaq_lane_f16(_sum8, _pA, _pB2, 0);
-                _sum9 = vfmaq_lane_f16(_sum9, _pA, _pB2, 1);
-                _suma = vfmaq_lane_f16(_suma, _pA, _pB2, 2);
-                _sumb = vfmaq_lane_f16(_sumb, _pA, _pB2, 3);
+                amx_ldx(false, 0, pA);
+                amx_ldy(false, 0, pB);
+                amx_fma16_masked(false, 0, 0, 0, 0x2, 8, 0x2, 12);
 
                 pA += 8;
                 pB += 12;
@@ -3365,52 +3087,53 @@ static void convolution_gemm_transB_packed_tile_fp16sa_amx(const Mat& AT_tile, c
             {
                 if (out_elempack == 8)
                 {
-                    vst1q_f16(outptr0, _sum0);
-                    vst1q_f16(outptr0 + 8, _sum1);
-                    vst1q_f16(outptr0 + 8 * 2, _sum2);
-                    vst1q_f16(outptr0 + 8 * 3, _sum3);
-                    vst1q_f16(outptr0 + 8 * 4, _sum4);
-                    vst1q_f16(outptr0 + 8 * 5, _sum5);
-                    vst1q_f16(outptr0 + 8 * 6, _sum6);
-                    vst1q_f16(outptr0 + 8 * 7, _sum7);
-                    vst1q_f16(outptr0 + 8 * 8, _sum8);
-                    vst1q_f16(outptr0 + 8 * 9, _sum9);
-                    vst1q_f16(outptr0 + 8 * 10, _suma);
-                    vst1q_f16(outptr0 + 8 * 11, _sumb);
+                    __fp16 tmp[96 + 24];
+                    for (int r = 0; r < 12; r++) {
+                        amx_stz(false, 2*r, tmp + r * 8);
+                    }
+                    memcpy(outptr0, tmp, 96 * sizeof(__fp16));
                     outptr0 += 96;
                 }
                 if (out_elempack == 4)
                 {
-                    vst1_f16(outptr0, vget_low_f16(_sum0));
-                    vst1_f16(outptr0 + 4, vget_low_f16(_sum1));
-                    vst1_f16(outptr0 + 4 * 2, vget_low_f16(_sum2));
-                    vst1_f16(outptr0 + 4 * 3, vget_low_f16(_sum3));
-                    vst1_f16(outptr0 + 4 * 4, vget_low_f16(_sum4));
-                    vst1_f16(outptr0 + 4 * 5, vget_low_f16(_sum5));
-                    vst1_f16(outptr0 + 4 * 6, vget_low_f16(_sum6));
-                    vst1_f16(outptr0 + 4 * 7, vget_low_f16(_sum7));
-                    vst1_f16(outptr0 + 4 * 8, vget_low_f16(_sum8));
-                    vst1_f16(outptr0 + 4 * 9, vget_low_f16(_sum9));
-                    vst1_f16(outptr0 + 4 * 10, vget_low_f16(_suma));
-                    vst1_f16(outptr0 + 4 * 11, vget_low_f16(_sumb));
-
-                    vst1_f16(outptr0 + out_hstep * 4, vget_high_f16(_sum0));
-                    vst1_f16(outptr0 + out_hstep * 4 + 4, vget_high_f16(_sum1));
-                    vst1_f16(outptr0 + out_hstep * 4 + 4 * 2, vget_high_f16(_sum2));
-                    vst1_f16(outptr0 + out_hstep * 4 + 4 * 3, vget_high_f16(_sum3));
-                    vst1_f16(outptr0 + out_hstep * 4 + 4 * 4, vget_high_f16(_sum4));
-                    vst1_f16(outptr0 + out_hstep * 4 + 4 * 5, vget_high_f16(_sum5));
-                    vst1_f16(outptr0 + out_hstep * 4 + 4 * 6, vget_high_f16(_sum6));
-                    vst1_f16(outptr0 + out_hstep * 4 + 4 * 7, vget_high_f16(_sum7));
-                    vst1_f16(outptr0 + out_hstep * 4 + 4 * 8, vget_high_f16(_sum8));
-                    vst1_f16(outptr0 + out_hstep * 4 + 4 * 9, vget_high_f16(_sum9));
-                    vst1_f16(outptr0 + out_hstep * 4 + 4 * 10, vget_high_f16(_suma));
-                    vst1_f16(outptr0 + out_hstep * 4 + 4 * 11, vget_high_f16(_sumb));
+                    __fp16 tmp[32];
+                    for (int r = 0; r < 12; r++) {
+                        amx_stz(false, 2*r, tmp);
+                        float16x8_t _tmp = vld1q_f16(tmp);
+                        vst1_f16(outptr0 + 4 * r, vget_low_f16(_tmp));
+                        vst1_f16(outptr0 + out_hstep * 4 + 4 * r, vget_high_f16(_tmp));
+                    }
 
                     outptr0 += 48;
                 }
                 if (out_elempack == 1)
                 {
+                    float16x8_t _sum0, _sum1, _sum2, _sum3, _sum4, _sum5, _sum6, _sum7, _sum8, _sum9, _suma, _sumb;
+                    __fp16 tmp[32];
+                    amx_stz(false, 0, tmp);
+                    _sum0 = vld1q_f16(tmp);
+                    amx_stz(false, 2, tmp);
+                    _sum1 = vld1q_f16(tmp);
+                    amx_stz(false, 4, tmp);
+                    _sum2 = vld1q_f16(tmp);
+                    amx_stz(false, 6, tmp);
+                    _sum3 = vld1q_f16(tmp);
+                    amx_stz(false, 8, tmp);
+                    _sum4 = vld1q_f16(tmp);
+                    amx_stz(false, 10, tmp);
+                    _sum5 = vld1q_f16(tmp);
+                    amx_stz(false, 12, tmp);
+                    _sum6 = vld1q_f16(tmp);
+                    amx_stz(false, 14, tmp);
+                    _sum7 = vld1q_f16(tmp);
+                    amx_stz(false, 16, tmp);
+                    _sum8 = vld1q_f16(tmp);
+                    amx_stz(false, 18, tmp);
+                    _sum9 = vld1q_f16(tmp);
+                    amx_stz(false, 20, tmp);
+                    _suma = vld1q_f16(tmp);
+                    amx_stz(false, 22, tmp);
+                    _sumb = vld1q_f16(tmp);
                     transpose8x12_ph(_sum0, _sum1, _sum2, _sum3, _sum4, _sum5, _sum6, _sum7, _sum8, _sum9, _suma, _sumb);
 
                     vst1_f16(outptr0, vget_low_f16(_sum0));
@@ -3443,18 +3166,11 @@ static void convolution_gemm_transB_packed_tile_fp16sa_amx(const Mat& AT_tile, c
             }
             else
             {
-                vst1q_f16(outptr, _sum0);
-                vst1q_f16(outptr + 8, _sum1);
-                vst1q_f16(outptr + 8 * 2, _sum2);
-                vst1q_f16(outptr + 8 * 3, _sum3);
-                vst1q_f16(outptr + 8 * 4, _sum4);
-                vst1q_f16(outptr + 8 * 5, _sum5);
-                vst1q_f16(outptr + 8 * 6, _sum6);
-                vst1q_f16(outptr + 8 * 7, _sum7);
-                vst1q_f16(outptr + 8 * 8, _sum8);
-                vst1q_f16(outptr + 8 * 9, _sum9);
-                vst1q_f16(outptr + 8 * 10, _suma);
-                vst1q_f16(outptr + 8 * 11, _sumb);
+                __fp16 tmp[32];
+                for (int r = 0; r < 12; r++) {
+                    amx_stz(false, 2*r, tmp);
+                    memcpy(outptr0 + 8 * r, tmp, 8 * sizeof(__fp16));
+                }
             }
 
             outptr += 96;
@@ -4987,6 +4703,231 @@ static void convolution_gemm_transB_packed_tile_fp16sa_amx(const Mat& AT_tile, c
 
         pAT += max_kk;
     }
+    amx_clr();
+}
+#endif // __aarch64__ && NCNN_APPLE_AMX
+
+static void convolution_im2col_gemm_get_optimal_tile_mnk_fp16sa(int M, int N, int K, int& TILE_M, int& TILE_N, int& TILE_K, int nT)
+{
+    // resolve optimal tile size from cache size
+    const int l2_cache_size_fp16 = (int)(get_cpu_level2_cache_size() / sizeof(unsigned short));
+
+    if (nT == 0)
+        nT = get_physical_big_cpu_count();
+
+    // solve K
+    {
+        // try not to split K
+        int tile_size = (l2_cache_size_fp16 - 32) / 12;
+
+        TILE_K = std::max(8, tile_size / 8 * 8);
+
+        int nn_K = (K + TILE_K - 1) / TILE_K;
+        TILE_K = std::min(TILE_K, ((K + nn_K - 1) / nn_K + 7) / 8 * 8);
+    }
+
+    // solve M
+    {
+        int nn_M = (M + 63) / 64;
+
+        TILE_M = std::max(8, ((M + nn_M - 1) / nn_M + 7) / 8 * 8);
+    }
+
+    {
+        TILE_M *= std::min(nT, get_physical_cpu_count());
+
+        int nn_M = (M + TILE_M - 1) / TILE_M;
+        TILE_M = std::min(TILE_M, ((M + nn_M - 1) / nn_M + 7) / 8 * 8);
+
+        if (nT > 1)
+        {
+            TILE_M = std::min(TILE_M, (std::max(1, TILE_M / nT) + 7) / 8 * 8);
+        }
+    }
+
+    if (N > 0)
+    {
+        int tile_size;
+        if (TILE_K >= K)
+        {
+            tile_size = (l2_cache_size_fp16 - TILE_M * TILE_K) / TILE_K;
+        }
+        else
+        {
+            tile_size = (l2_cache_size_fp16 - TILE_M * TILE_K) / (TILE_M + TILE_K);
+        }
+
+        TILE_N = std::max(4, tile_size / 4 * 4);
+
+        int nn_N = (N + TILE_N - 1) / TILE_N;
+        TILE_N = std::min(TILE_N, ((N + nn_N - 1) / nn_N + 3) / 4 * 4);
+    }
 }
 
-#endif // __aarch64__ && NCNN_APPLE_AMX
+static void convolution_im2col_gemm_transform_kernel_fp16sa(const Mat& kernel, Mat& AT, int inch, int outch, int kernel_w, int kernel_h, const Option& opt)
+{
+    // NCNN_LOGE("convolution_im2col_gemm_transform_kernel_fp16sa %p", kernel.data);
+    const int maxk = kernel_w * kernel_h;
+
+    const int M = outch;
+    const int K = inch * maxk;
+
+    int TILE_M, TILE_N, TILE_K;
+    convolution_im2col_gemm_get_optimal_tile_mnk_fp16sa(M, 0, K, TILE_M, TILE_N, TILE_K, opt.num_threads);
+
+    const int nn_M = (M + TILE_M - 1) / TILE_M;
+
+    int elempack = 1;
+    if (opt.use_packing_layout)
+    {
+        elempack = inch % 8 == 0 ? 8 : inch % 4 == 0 ? 4 : 1;
+    }
+
+    // maxk-inch-outch to pa-maxk-inch/pa-outch
+    Mat A_data;
+    if (maxk == 1)
+    {
+        cast_float32_to_float16(kernel, A_data);
+        A_data = A_data.reshape(maxk * inch, outch);
+    }
+    else
+    {
+        Mat weight_data_r2 = kernel.reshape(maxk, inch, outch);
+
+        A_data.create(maxk * inch, outch, (size_t)2u);
+
+        for (int q = 0; q < outch; q += 1)
+        {
+            __fp16* g00 = A_data.row<__fp16>(q);
+
+            for (int p = 0; p + (elempack - 1) < inch; p += elempack)
+            {
+                for (int k = 0; k < maxk; k++)
+                {
+                    for (int i = 0; i < elempack; i++)
+                    {
+                        const float* k00 = weight_data_r2.channel(q).row(p + i);
+                        g00[0] = (__fp16)k00[k];
+                        g00++;
+                    }
+                }
+            }
+        }
+    }
+
+    AT.create(TILE_K * TILE_M, (K + TILE_K - 1) / TILE_K, (M + TILE_M - 1) / TILE_M, (size_t)2u);
+
+    #pragma omp parallel for num_threads(opt.num_threads)
+    for (int ppj = 0; ppj < nn_M; ppj++)
+    {
+        const int i = ppj * TILE_M;
+
+        const int max_ii = std::min((M - i), TILE_M);
+
+        for (int k = 0; k < K; k += TILE_K)
+        {
+            const int max_kk = std::min((K - k), TILE_K);
+
+            Mat AT_tile = AT.channel(i / TILE_M).row_range(k / TILE_K, 1);
+
+            convolution_im2col_pack_A_tile_bf16_fp16(A_data, AT_tile, i, max_ii, k, max_kk);
+        }
+    }
+}
+
+static int convolution_im2col_gemm_fp16sa(const Mat& bottom_blob, Mat& top_blob, const Mat& AT, const Mat& bias, int kernel_w, int kernel_h, int dilation_w, int dilation_h, int stride_w, int stride_h, int nT, const Option& opt)
+{
+    // NCNN_LOGE("convolution_im2col_gemm_fp16sa %p %p %p %p", bottom_blob.data, top_blob.data, AT.data, bias.data);
+    const int maxk = kernel_w * kernel_h;
+
+    const int M = top_blob.c * top_blob.elempack;
+    const int N = top_blob.w * top_blob.h;
+    const int K = bottom_blob.c * bottom_blob.elempack * maxk;
+
+    int TILE_M, TILE_N, TILE_K;
+    convolution_im2col_gemm_get_optimal_tile_mnk_fp16sa(M, N, K, TILE_M, TILE_N, TILE_K, nT);
+
+    const int nn_M = (M + TILE_M - 1) / TILE_M;
+    const int nn_N = (N + TILE_N - 1) / TILE_N;
+    const int nn_K = (K + TILE_K - 1) / TILE_K;
+
+    // NCNN_LOGE("TILE M/N/K = %d %d %d -> %d %d %d", M, N, K, TILE_M, TILE_N, TILE_K);
+
+    Mat BT(TILE_K * TILE_N, (K + TILE_K - 1) / TILE_K, (N + TILE_N - 1) / TILE_N, 2u, opt.workspace_allocator);
+    if (BT.empty())
+        return -100;
+
+    const int nn_NK = nn_N * nn_K;
+
+    #pragma omp parallel for num_threads(nT)
+    for (int ppjk = 0; ppjk < nn_NK; ppjk++)
+    {
+        const int ppj = ppjk / nn_K;
+        const int ppk = ppjk % nn_K;
+
+        const int j = ppj * TILE_N;
+        const int k = ppk * TILE_K;
+
+        const int max_jj = std::min((N - j), TILE_N);
+        const int max_kk = std::min((K - k), TILE_K);
+
+        Mat BT_tile = BT.channel(j / TILE_N).row_range(k / TILE_K, 1);
+
+        // im2col
+        convolution_im2col_input_tile_bf16_fp16(bottom_blob, BT_tile, j, max_jj, k, max_kk, kernel_w, kernel_h, dilation_w, dilation_h, stride_w, stride_h);
+    }
+
+    Mat topT_tileX;
+    if (K > TILE_K)
+    {
+        topT_tileX.create(TILE_N * TILE_M, 1, nT, 2u, opt.workspace_allocator);
+        if (topT_tileX.empty())
+            return -100;
+    }
+
+#if __aarch64__ && NCNN_APPLE_AMX
+    bool amx_supported = cpu_support_arm_amx();
+#endif
+
+    #pragma omp parallel for num_threads(nT)
+    for (int ppj = 0; ppj < nn_M; ppj++)
+    {
+        const int i = ppj * TILE_M;
+
+        Mat topT_tile;
+        if (K > TILE_K)
+            topT_tile = topT_tileX.channel(get_omp_thread_num());
+
+        const int max_ii = std::min((M - i), TILE_M);
+
+        for (int j = 0; j < N; j += TILE_N)
+        {
+            const int max_jj = std::min((N - j), TILE_N);
+
+            for (int k = 0; k < K; k += TILE_K)
+            {
+                const int max_kk = std::min((K - k), TILE_K);
+
+                const Mat AT_tile = AT.channel(i / TILE_M).row_range(k / TILE_K, 1);
+
+                const Mat BT_tile = BT.channel(j / TILE_N).row_range(k / TILE_K, 1);
+
+                bool k_end = k + TILE_K >= K;
+
+#if __aarch64__ && NCNN_APPLE_AMX
+// #if 0
+                if (amx_supported)
+                {
+                    convolution_gemm_transB_packed_tile_fp16sa_amx(AT_tile, BT_tile, bias, topT_tile, top_blob, i, max_ii, j, max_jj, k, max_kk, k_end);
+                }
+                else
+#endif
+                {
+                    convolution_gemm_transB_packed_tile_fp16sa(AT_tile, BT_tile, bias, topT_tile, top_blob, i, max_ii, j, max_jj, k, max_kk, k_end, opt.use_a53_a55_optimized_kernel);
+                }
+            }
+        }
+    }
+
+    return 0;
+}
